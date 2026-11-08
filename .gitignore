@@ -1,0 +1,18 @@
+# Swift / SPM
+.build/
+*.xcodeproj
+DerivedData/
+*.db
+*.db-wal
+*.db-shm
+
+# Node
+node_modules/
+.wrangler/
+
+# 系统
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

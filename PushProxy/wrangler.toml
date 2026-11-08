@@ -1,0 +1,16 @@
+name = "twinperch-push-proxy"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+# 开发者运营的唯一组件（docs/05-推送代理.md），opt-in、内容零知识。
+# APNs 凭证通过 wrangler secret 注入：
+#   wrangler secret put APNS_KEY_ID
+#   wrangler secret put APNS_TEAM_ID
+#   wrangler secret put APNS_TOKEN_BUNDLE   # .p8 私钥的 Base64
+#   wrangler secret put PROXY_NOTIFY_KEY   # relay→proxy 的防滥用密钥
+[vars]
+APNS_HOST = "https://api.push.apple.com"
+
+[[kv_namespaces]]
+binding = "REGISTRATIONS"
+id = "REPLACE_WITH_KV_ID"          # wrangler kv namespace create REGISTRATIONS
