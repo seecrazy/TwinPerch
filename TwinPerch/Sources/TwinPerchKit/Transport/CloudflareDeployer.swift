@@ -22,11 +22,14 @@ public enum DeployError: Error, Equatable {
 }
 
 public struct CloudflareDeployer: Sendable {
-    /// Worker 脚本内容（编译后的 JS 模块）。App 打包管线负责把 Worker/ 编译产物带入。
-    public var scriptContent: String
+    /// Worker 脚本内容（编译后的 JS 模块）。默认取打包管线产物；缺失则 deploy 时抛错。
+    public var scriptContent: String? = nil
+    /// 可注入会话（测试用 URLProtocol 桩；线上 shared）
+    private let urlSession: URLSession
 
-    public init(scriptContent: String = TwinPerchRelayScript.content) {
+    public init(scriptContent: String? = nil, urlSession: URLSession = .shared) {
         self.scriptContent = scriptContent
+        self.urlSession = urlSession
     }
 
     public static let scriptName = "twinperch-relay"
@@ -34,10 +37,11 @@ public struct CloudflareDeployer: Sendable {
     // MARK: - 部署主流程
 
     public func deploy(oauthToken: String) async throws -> DeployResult {
-        let accountID = try await firstAccount(oauthToken: oauthToken)
-        try await uploadScript(accountID: accountID, oauthToken: oauthToken)
-        let workerURL = try await enableSubdomain(accountID: accountID, oauthToken: oauthToken)
         let deployKey = TP.randomBytes(24).hex()
+        let script = try scriptContent ?? TwinPerchRelayScript.requireContent()
+        let accountID = try await firstAccount(oauthToken: oauthToken)
+        try await uploadScript(accountID: accountID, oauthToken: oauthToken, deployKey: deployKey, script: script)
+        let workerURL = try await enableSubdomain(accountID: accountID, oauthToken: oauthToken)
         return DeployResult(accountID: accountID, workerURL: workerURL, deployKey: deployKey)
     }
 
@@ -55,7 +59,7 @@ public struct CloudflareDeployer: Sendable {
         request.setValue(deployKey, forHTTPHeaderField: "x-tp-deploy-key")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: request)
+        let (data, resp) = try await urlSession.data(for: request)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             throw DeployError.apiError(String(decoding: data, as: UTF8.self))
         }
@@ -74,12 +78,15 @@ public struct CloudflareDeployer: Sendable {
 
     /// PUT /accounts/{id}/workers/scripts/{name}：multipart（metadata + main module）
     /// metadata 含 new_sqlite_classes migration 与 DO binding（免费层必需）
-    func uploadScript(accountID: String, oauthToken: String) async throws {
+    func uploadScript(accountID: String, oauthToken: String, deployKey: String, script: String) async throws {
         let metadata: [String: Any] = [
             "main_module": "worker.js",
             "compatibility_date": "2025-04-01",
             "bindings": [
                 ["type": "durable_object_namespace", "name": "ROOM", "class_name": "Room"],
+                ["type": "plain_text", "name": "DEPLOY_KEY", "text": deployKey],
+                ["type": "plain_text", "name": "PUSH_PROXY_URL", "text": ""],
+                ["type": "plain_text", "name": "PUSH_PROXY_KEY", "text": ""],
             ],
             "migrations": ["new_tag": "v1", "new_sqlite_classes": ["Room"]],
         ]
@@ -98,7 +105,7 @@ public struct CloudflareDeployer: Sendable {
         addPart(name: "metadata", filename: nil, contentType: "application/json",
                 content: try JSONSerialization.data(withJSONObject: metadata))
         addPart(name: "worker.js", filename: "worker.js", contentType: "application/javascript+module",
-                content: Data(scriptContent.utf8))
+                content: Data(script.utf8))
         body.append(Data("--\(boundary)--\r\n".utf8))
 
         let url = URL(string: "https://api.cloudflare.com/client/v4/accounts/\(accountID)/workers/scripts/\(Self.scriptName)")!
@@ -107,7 +114,7 @@ public struct CloudflareDeployer: Sendable {
         request.setValue("Bearer \(oauthToken)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
-        let (data, resp) = try await URLSession.shared.data(for: request)
+        let (data, resp) = try await urlSession.data(for: request)
         guard (resp as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               json["success"] as? Bool == true else {
@@ -131,7 +138,7 @@ public struct CloudflareDeployer: Sendable {
         request.setValue("Bearer \(oauthToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["enabled": true, "previews": false])
-        let (data, resp) = try await URLSession.shared.data(for: request)
+        let (data, resp) = try await urlSession.data(for: request)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             throw DeployError.apiError(String(decoding: data, as: UTF8.self))
         }
@@ -141,7 +148,7 @@ public struct CloudflareDeployer: Sendable {
     private func apiGET(_ urlString: String, token: String) async throws -> [String: Any] {
         var request = URLRequest(url: URL(string: urlString)!)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (data, resp) = try await URLSession.shared.data(for: request)
+        let (data, resp) = try await urlSession.data(for: request)
         guard (resp as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               json["success"] as? Bool == true else {
@@ -151,12 +158,24 @@ public struct CloudflareDeployer: Sendable {
     }
 }
 
-/// 部署时上传的 Worker 脚本源（占位结构）。
-/// App 打包管线把 Worker/ 的编译产物（esbuild/wrangler 产出的 ESM 单文件）写入此文件，
-/// 保持脚本与 Worker/src 同源——不允许出现两份漂移的实现。
+/// 部署时上传的 Worker 脚本：由 Worker/build.mjs 从 Worker/src 编译生成
+/// （RelayScript.generated.swift，Base64 内嵌，避免转义漂移）。
+/// 若尚未运行打包管线，显式报错提示，绝不上传占位脚本。
+public enum TwinPerchRelayScriptError: Error { case notBuilt }
+
 public enum TwinPerchRelayScript {
-    public static let content = """
-    // 由打包管线生成：编译 Worker/src/index.ts（见 Worker/README）。占位以通过编译。
-    export default { fetch() { return new Response("placeholder", { status: 500 }); } };
-    """
+    /// 由 Worker/build.mjs 生成的编译产物（RelayScript.generated.swift 存 Base64）；
+    /// 未打包时为 nil
+    public static var generated: String? {
+        guard let b64 = RelayScriptGenerated.contentBase64,
+              let data = Data(base64Encoded: b64) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    public static func requireContent() throws -> String {
+        guard let c = generated, c.contains("Room"), c.contains("bootstrap") else {
+            throw TwinPerchRelayScriptError.notBuilt
+        }
+        return c
+    }
 }

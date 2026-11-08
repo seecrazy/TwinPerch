@@ -147,7 +147,12 @@ public struct ResponderSheet: View {
                         dismiss()
                     }
                 } else {
-                    Text("粘贴对方二维码的内容（真机为扫码）")
+                    if QRScannerHook.canScan {
+                        DS.PrimaryButton("扫描对方的码") {
+                            QRScannerHook.present?()
+                        }
+                    }
+                    Text("或粘贴对方二维码的内容")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     TextField("对方二维码 Base64", text: $peerQR)
@@ -216,10 +221,15 @@ public struct PairingView: View {
                             }
                         }
                     }
-                    TextField("粘贴对方二维码（发起方第二步）", text: $pastedPeerQR)
+                    if QRScannerHook.canScan {
+                        DS.PrimaryButton("扫描对方的码，完成配对") {
+                            QRScannerHook.present?()
+                        }
+                    }
+                    TextField("或粘贴对方二维码 Base64", text: $pastedPeerQR)
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
-                    DS.PrimaryButton("扫到了，完成配对") {
+                    DS.PrimaryButton("完成配对") {
                         try? model.completeAsInitiator(peerQRBase64: pastedPeerQR)
                     }
                     .disabled(pastedPeerQR.isEmpty)

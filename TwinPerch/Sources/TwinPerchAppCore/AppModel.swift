@@ -376,6 +376,66 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// 扫码回调分派：已出过码（发起方）→ 收尾握手；否则 → 响应方流程。
+    /// iOS 相机扫码与桌面粘贴框共用这一个入口。
+    public func ingestPeerQR(_ base64: String) throws {
+        if pendingInitiatorStart != nil {
+            try completeAsInitiator(peerQRBase64: base64)
+        } else {
+            _ = try acceptAsResponder(peerQRBase64: base64, address: myAddress)
+        }
+    }
+
+    /// iOS 壳层回调：APNs token 注册（opt-in 推送）
+    public func updateAPNsToken(_ tokenData: Data) async {
+        guard let vault else { return }
+        let token = tokenData.map { String(format: "%02x", $0) }.joined()
+        try? vault.setKV(Self.apnsTokenKey, data: Data(token.utf8))
+        let enabled = (try? vault.value(forKey: Self.pushEnabledKey))?.first == 1
+        guard enabled,
+              let saved = try? vault.value(forKey: Self.proxyURLKey),
+              let url = URL(string: String(decoding: saved, as: UTF8.self)) else { return }
+        let deviceID = currentDeviceID()
+        try? await PushProxyClient(baseURL: url).register(deviceID: deviceID, apnsToken: token)
+    }
+
+    private func currentDeviceID() -> String {
+        if let saved = try? vault?.value(forKey: Self.deviceIDKey),
+           let s = String(data: saved, encoding: .utf8), !s.isEmpty {
+            return s
+        }
+        let id = generateDeviceID()
+        try? vault?.setKV(Self.deviceIDKey, data: Data(id.utf8))
+        return id
+    }
+
+    /// 推送 opt-in 落库与注册（docs/05：代理只见随机 device_id + 计数）
+    public func setPushEnabled(_ enabled: Bool, proxyURL: URL) async {
+        guard let vault else { return }
+        try? vault.setKV(Self.pushEnabledKey, data: Data([enabled ? 1 : 0]))
+        try? vault.setKV(Self.proxyURLKey, data: Data(proxyURL.absoluteString.utf8))
+        let client = PushProxyClient(baseURL: proxyURL)
+        if enabled {
+            let deviceID = currentDeviceID()
+            if let saved = try? vault.value(forKey: Self.apnsTokenKey),
+               let token = String(data: saved, encoding: .utf8) {
+                try? await client.register(deviceID: deviceID, apnsToken: token)
+            }
+            // 尚无 token：等壳层 APNs 回调后由 updateAPNsToken 补注册
+        } else {
+            try? await client.unregister(deviceID: currentDeviceID())
+        }
+    }
+
+    /// iOS 后台刷新（BGTask）与回前台补账共用：补发队列 + 拉取积压
+    public func backgroundFetch() async {
+        guard let transport else { return }
+        retryPendingOutbox()
+        if let pending = try? await transport.fetchPending() {
+            for e in pending { ingest(e.data) }
+        }
+    }
+
     /// 一键请求重同步（解密失败提示的按钮动作）
     public func sendSyncRequest() throws {
         guard let session else { throw TPError.invalidInput }
@@ -436,29 +496,6 @@ public final class AppModel: ObservableObject {
                         if s == .online { self?.retryPendingOutbox() }
                     }
                 }
-            }
-        }
-    }
-
-    /// 推送 opt-in（docs/05：代理只见随机 device_id + 计数）
-    public func setPushEnabled(_ enabled: Bool, proxyURL: URL) async {
-        guard let vault else { return }
-        let client = PushProxyClient(baseURL: proxyURL)
-        if enabled {
-            let deviceID: String
-            if let saved = try? vault.value(forKey: Self.deviceIDKey),
-               let s = String(data: saved, encoding: .utf8), !s.isEmpty {
-                deviceID = s
-            } else {
-                deviceID = generateDeviceID()
-                try? vault.setKV(Self.deviceIDKey, data: Data(deviceID.utf8))
-            }
-            // 真实 APNs token 由 iOS 壳层注册后更新注册项
-            try? await client.register(deviceID: deviceID, apnsToken: "pending-shell")
-        } else {
-            if let saved = try? vault.value(forKey: Self.deviceIDKey),
-               let s = String(data: saved, encoding: .utf8) {
-                try? await client.unregister(deviceID: s)
             }
         }
     }
@@ -528,6 +565,9 @@ public final class AppModel: ObservableObject {
     public static let sessionKey = "tp.session.state"
     public static let peerKeyKey = "tp.session.peer-ik"
     public static let deviceIDKey = "tp.push.device-id"
+    public static let apnsTokenKey = "tp.push.apns-token"
+    public static let pushEnabledKey = "tp.push.enabled"
+    public static let proxyURLKey = "tp.push.proxy-url"
 
     var vaultDirectoryOverride: URL?
 
@@ -557,8 +597,34 @@ public final class AppModel: ObservableObject {
         transport = t
     }
 
+    /// App 内一键部署 Cloudflare 中转（docs/04）：部署 → 写入房间元数据 → 接管连接。
+    public func deployRelay(oauthToken: String) async throws -> URL {
+        guard let session else { throw TPError.invalidInput }
+        let deployer = CloudflareDeployer()
+        let result = try await deployer.deploy(oauthToken: oauthToken)
+        try await deployer.bootstrapRoom(workerURL: result.workerURL,
+                                         deployKey: result.deployKey,
+                                         roomID: session.material.roomID,
+                                         kRoom: session.material.kRoom,
+                                         deviceID: currentDeviceID())
+        try await connectManualRelay(url: result.workerURL)
+        return result.workerURL
+    }
+
     public func transportSession() throws -> TransportSession {
         guard let session else { throw TPError.invalidInput }
         return TransportSession(roomID: session.material.roomID, authKey: session.material.kRoom)
     }
 }
+
+/// 扫码接入点：桌面端无相机（粘贴框），iOS 壳层注入相机扫码。
+/// 壳层扫到内容后调 onScanned → AppModel.ingestPeerQR。
+public enum QRScannerHook {
+    /// 平台具备扫码能力（壳层启动时置 true）
+    public static var canScan = false
+    /// 壳层注入：弹出扫码界面
+    public static var present: (() -> Void)?
+    /// 壳层注入：扫到配对码（Base64）
+    public static var onScanned: ((String) -> Void)?
+}
+

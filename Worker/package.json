@@ -6,10 +6,12 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "bundle": "node build.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261104.1",
+    "esbuild": "^0.28.2",
     "typescript": "^5.6.0",
     "wrangler": "^4.0.0"
   }
